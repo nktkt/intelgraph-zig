@@ -15,6 +15,7 @@ The default local store is `.intelgraph/events.tsv` in the current directory.
 - Show entity-centered context and neighboring entities
 - Build filtered timelines
 - Find shortest paths between related entities
+- Rank frequently observed entities and relationships
 - Export an undirected Graphviz DOT graph
 
 ## Build
@@ -32,6 +33,8 @@ zig build run -- init
 zig build run -- ingest examples/access.log
 zig build run -- stats
 zig build run -- entity ip:10.0.0.12
+zig build run -- rank entities --kind domain --limit 10
+zig build run -- rank edges --limit 10
 zig build run -- path alice@example.com suspicious.example
 zig build run -- timeline --entity suspicious.example
 zig build run -- export graph --out graph.dot
@@ -52,6 +55,8 @@ intel [--db PATH] search <text>
 intel [--db PATH] entity <value|kind:value>
 intel [--db PATH] timeline [--entity <value|kind:value>]
 intel [--db PATH] path <from> <to>
+intel [--db PATH] rank entities [--kind KIND] [--limit N]
+intel [--db PATH] rank edges [--limit N]
 intel [--db PATH] export graph [--format dot] [--out file.dot]
 intel [--db PATH] stats
 ```
@@ -67,4 +72,4 @@ intel [--db PATH] stats
 
 ## Design Notes
 
-This is an MVP. The current ingestion path reads files up to 128 MiB into memory, and the local store is a TSV file for portability and easy inspection. A streaming reader, SQLite/FTS5 backend, Zeek log parser, Sigma/YARA result importers, and richer TUI views are natural next steps.
+This is an MVP. Ingestion is streaming and caps individual input lines at 1 MiB. The local store is still read into memory for graph-oriented commands, and it is a TSV file for portability and easy inspection. A SQLite/FTS5 backend, Zeek log parser, Sigma/YARA result importers, and richer TUI views are natural next steps.

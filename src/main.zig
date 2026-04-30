@@ -2,7 +2,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const default_db_path = ".intelgraph/events.tsv";
-const max_input_bytes = 128 * 1024 * 1024;
+const max_line_bytes = 1024 * 1024;
 const max_store_bytes = 256 * 1024 * 1024;
 
 const Entity = struct {
@@ -25,6 +25,16 @@ const EventSet = struct {
     fn deinit(self: *EventSet) void {
         self.arena.deinit();
     }
+};
+
+const IngestStats = struct {
+    ingested: u64 = 0,
+    with_entities: u64 = 0,
+};
+
+const CountItem = struct {
+    key: []const u8,
+    count: u64,
 };
 
 const Cli = struct {
@@ -65,6 +75,8 @@ pub fn main() !void {
         try cmdTimeline(gpa, cli.db_path, rest);
     } else if (std.mem.eql(u8, command, "path")) {
         try cmdPath(gpa, cli.db_path, rest);
+    } else if (std.mem.eql(u8, command, "rank")) {
+        try cmdRank(gpa, cli.db_path, rest);
     } else if (std.mem.eql(u8, command, "export")) {
         try cmdExport(gpa, cli.db_path, rest);
     } else {
@@ -103,12 +115,15 @@ fn printUsage() !void {
         \\  intel [--db PATH] entity <value|kind:value>
         \\  intel [--db PATH] timeline [--entity <value|kind:value>]
         \\  intel [--db PATH] path <from> <to>
+        \\  intel [--db PATH] rank entities [--kind KIND] [--limit N]
+        \\  intel [--db PATH] rank edges [--limit N]
         \\  intel [--db PATH] export graph [--format dot] [--out file.dot]
         \\  intel [--db PATH] stats
         \\
         \\Examples:
         \\  intel ingest examples/access.log
         \\  intel entity ip:10.0.0.12
+        \\  intel rank entities --kind domain --limit 10
         \\  intel path alice@example.com suspicious.example
         \\  intel export graph --out graph.dot
         \\
@@ -143,8 +158,8 @@ fn cmdIngest(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
 
     try ensureStore(db_path);
 
-    const content = try std.fs.cwd().readFileAlloc(gpa, input_path, max_input_bytes);
-    defer gpa.free(content);
+    var input_file = try std.fs.cwd().openFile(input_path, .{});
+    defer input_file.close();
 
     var file = try std.fs.cwd().createFile(db_path, .{ .read = true, .truncate = false });
     defer file.close();
@@ -153,34 +168,62 @@ fn cmdIngest(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
     var file_writer = file.writer(&out_buf);
     const out = &file_writer.interface;
 
-    var next_id = try countExistingEvents(gpa, db_path) + 1;
-    var ingested: u64 = 0;
-    var with_entities: u64 = 0;
+    var next_id = try countExistingEvents(db_path) + 1;
+    var stats = IngestStats{};
 
-    var line_iter = std.mem.splitScalar(u8, content, '\n');
-    while (line_iter.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
-        if (std.mem.trim(u8, line, " \t").len == 0) continue;
+    var read_buf: [64 * 1024]u8 = undefined;
+    var line_buf: std.ArrayList(u8) = .empty;
+    defer line_buf.deinit(gpa);
 
-        const timestamp = try extractTimestamp(gpa, line);
-        defer gpa.free(timestamp);
-
-        const entities = try extractEntities(gpa, line);
-        defer freeEntities(gpa, entities);
-
-        if (entities.len > 0) with_entities += 1;
-
-        try appendEvent(out, next_id, timestamp, source, line, entities);
-        next_id += 1;
-        ingested += 1;
+    while (true) {
+        const n = try input_file.read(&read_buf);
+        if (n == 0) break;
+        for (read_buf[0..n]) |byte| {
+            if (byte == '\n') {
+                try ingestLine(gpa, out, &next_id, source, line_buf.items, &stats);
+                line_buf.clearRetainingCapacity();
+            } else {
+                if (line_buf.items.len >= max_line_bytes) {
+                    return fail("input line exceeds {d} bytes", .{max_line_bytes});
+                }
+                try line_buf.append(gpa, byte);
+            }
+        }
+    }
+    if (line_buf.items.len > 0) {
+        try ingestLine(gpa, out, &next_id, source, line_buf.items, &stats);
     }
     try out.flush();
 
     var buf: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buf);
     const stdout = &writer.interface;
-    try stdout.print("ingested {d} events ({d} with entities) into {s}\n", .{ ingested, with_entities, db_path });
+    try stdout.print("ingested {d} events ({d} with entities) into {s}\n", .{ stats.ingested, stats.with_entities, db_path });
     try stdout.flush();
+}
+
+fn ingestLine(
+    gpa: Allocator,
+    writer: *std.Io.Writer,
+    next_id: *u64,
+    source: []const u8,
+    raw_line: []const u8,
+    stats: *IngestStats,
+) !void {
+    const line = std.mem.trimRight(u8, raw_line, "\r");
+    if (std.mem.trim(u8, line, " \t").len == 0) return;
+
+    const timestamp = try extractTimestamp(gpa, line);
+    defer gpa.free(timestamp);
+
+    const entities = try extractEntities(gpa, line);
+    defer freeEntities(gpa, entities);
+
+    if (entities.len > 0) stats.with_entities += 1;
+
+    try appendEvent(writer, next_id.*, timestamp, source, line, entities);
+    next_id.* += 1;
+    stats.ingested += 1;
 }
 
 fn cmdStats(gpa: Allocator, db_path: []const u8) !void {
@@ -384,6 +427,146 @@ fn cmdPath(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void 
     try out.flush();
 }
 
+fn cmdRank(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
+    if (args.len < 1) return fail("rank requires entities or edges", .{});
+    if (std.mem.eql(u8, args[0], "entities")) {
+        try cmdRankEntities(gpa, db_path, args[1..]);
+    } else if (std.mem.eql(u8, args[0], "edges")) {
+        try cmdRankEdges(gpa, db_path, args[1..]);
+    } else {
+        return fail("unknown rank target: {s}", .{args[0]});
+    }
+}
+
+fn cmdRankEntities(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
+    var limit: usize = 20;
+    var kind_filter: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--limit")) {
+            if (i + 1 >= args.len) return fail("--limit requires a value", .{});
+            limit = try parseLimit(args[i + 1]);
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--kind")) {
+            if (i + 1 >= args.len) return fail("--kind requires a value", .{});
+            kind_filter = args[i + 1];
+            i += 2;
+        } else {
+            return fail("unknown rank entities option: {s}", .{args[i]});
+        }
+    }
+
+    var set = try loadEvents(gpa, db_path);
+    defer set.deinit();
+
+    var counts = std.StringHashMap(u64).init(gpa);
+    defer {
+        var keys = counts.keyIterator();
+        while (keys.next()) |key| gpa.free(key.*);
+        counts.deinit();
+    }
+
+    for (set.events) |event| {
+        for (event.entities) |entity| {
+            if (kind_filter) |kind| {
+                if (!std.ascii.eqlIgnoreCase(entity.kind, kind)) continue;
+            }
+
+            const key = try entityKeyAlloc(gpa, entity);
+            if (counts.getPtr(key)) |count| {
+                count.* += 1;
+                gpa.free(key);
+            } else {
+                try counts.put(key, 1);
+            }
+        }
+    }
+
+    var items: std.ArrayList(CountItem) = .empty;
+    defer items.deinit(gpa);
+
+    var iter = counts.iterator();
+    while (iter.next()) |entry| {
+        try items.append(gpa, .{ .key = entry.key_ptr.*, .count = entry.value_ptr.* });
+    }
+    std.mem.sort(CountItem, items.items, {}, countItemGreater);
+
+    var buf: [8192]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buf);
+    const out = &writer.interface;
+
+    const shown = @min(limit, items.items.len);
+    for (items.items[0..shown], 0..) |item, idx| {
+        try out.print("{d}. {s} ({d})\n", .{ idx + 1, item.key, item.count });
+    }
+    try out.print("ranked: {d}\n", .{items.items.len});
+    try out.flush();
+}
+
+fn cmdRankEdges(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
+    var limit: usize = 20;
+
+    var i: usize = 0;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--limit")) {
+            if (i + 1 >= args.len) return fail("--limit requires a value", .{});
+            limit = try parseLimit(args[i + 1]);
+            i += 2;
+        } else {
+            return fail("unknown rank edges option: {s}", .{args[i]});
+        }
+    }
+
+    var set = try loadEvents(gpa, db_path);
+    defer set.deinit();
+
+    var counts = std.StringHashMap(u64).init(gpa);
+    defer {
+        var keys = counts.keyIterator();
+        while (keys.next()) |key| gpa.free(key.*);
+        counts.deinit();
+    }
+
+    for (set.events) |event| {
+        var left_index: usize = 0;
+        while (left_index < event.entities.len) : (left_index += 1) {
+            var right_index = left_index + 1;
+            while (right_index < event.entities.len) : (right_index += 1) {
+                const key = try edgeKeyAlloc(gpa, event.entities[left_index], event.entities[right_index]);
+                if (counts.getPtr(key)) |count| {
+                    count.* += 1;
+                    gpa.free(key);
+                } else {
+                    try counts.put(key, 1);
+                }
+            }
+        }
+    }
+
+    var items: std.ArrayList(CountItem) = .empty;
+    defer items.deinit(gpa);
+
+    var iter = counts.iterator();
+    while (iter.next()) |entry| {
+        try items.append(gpa, .{ .key = entry.key_ptr.*, .count = entry.value_ptr.* });
+    }
+    std.mem.sort(CountItem, items.items, {}, countItemGreater);
+
+    var buf: [8192]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buf);
+    const out = &writer.interface;
+
+    const shown = @min(limit, items.items.len);
+    for (items.items[0..shown], 0..) |item, idx| {
+        try out.print("{d}. ", .{idx + 1});
+        try writeEdgeLabel(out, item.key);
+        try out.print(" ({d})\n", .{item.count});
+    }
+    try out.print("ranked: {d}\n", .{items.items.len});
+    try out.flush();
+}
+
 fn cmdExport(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
     if (args.len < 1 or !std.mem.eql(u8, args[0], "graph")) {
         return fail("export currently supports: export graph [--format dot] [--out file.dot]", .{});
@@ -433,18 +616,30 @@ fn ensureStore(db_path: []const u8) !void {
     file.close();
 }
 
-fn countExistingEvents(gpa: Allocator, db_path: []const u8) !u64 {
-    const data = std.fs.cwd().readFileAlloc(gpa, db_path, max_store_bytes) catch |err| switch (err) {
+fn countExistingEvents(db_path: []const u8) !u64 {
+    var file = std.fs.cwd().openFile(db_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer gpa.free(data);
+    defer file.close();
 
+    var buf: [64 * 1024]u8 = undefined;
     var count: u64 = 0;
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.trim(u8, line, " \t\r").len != 0) count += 1;
+    var non_empty_line = false;
+
+    while (true) {
+        const n = try file.read(&buf);
+        if (n == 0) break;
+        for (buf[0..n]) |byte| {
+            if (byte == '\n') {
+                if (non_empty_line) count += 1;
+                non_empty_line = false;
+            } else if (byte != ' ' and byte != '\t' and byte != '\r') {
+                non_empty_line = true;
+            }
+        }
     }
+    if (non_empty_line) count += 1;
     return count;
 }
 
@@ -857,6 +1052,46 @@ fn entityKeyAlloc(allocator: Allocator, entity: Entity) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}:{s}", .{ entity.kind, entity.value });
 }
 
+fn edgeKeyAlloc(allocator: Allocator, left: Entity, right: Entity) ![]u8 {
+    const left_key = try entityKeyAlloc(allocator, left);
+    defer allocator.free(left_key);
+    const right_key = try entityKeyAlloc(allocator, right);
+    defer allocator.free(right_key);
+    return canonicalEdgeKeyAlloc(allocator, left_key, right_key);
+}
+
+fn canonicalEdgeKeyAlloc(allocator: Allocator, left: []const u8, right: []const u8) ![]u8 {
+    if (std.mem.lessThan(u8, left, right)) {
+        return std.fmt.allocPrint(allocator, "{s}\t{s}", .{ left, right });
+    }
+    return std.fmt.allocPrint(allocator, "{s}\t{s}", .{ right, left });
+}
+
+fn writeEdgeLabel(writer: *std.Io.Writer, edge_key: []const u8) !void {
+    const tab = std.mem.indexOfScalar(u8, edge_key, '\t') orelse {
+        try writer.writeAll(edge_key);
+        return;
+    };
+    try writer.print("{s} <-> {s}", .{ edge_key[0..tab], edge_key[tab + 1 ..] });
+}
+
+fn countItemGreater(_: void, lhs: CountItem, rhs: CountItem) bool {
+    if (lhs.count == rhs.count) return std.mem.lessThan(u8, lhs.key, rhs.key);
+    return lhs.count > rhs.count;
+}
+
+fn parseLimit(value: []const u8) !usize {
+    const parsed = std.fmt.parseInt(usize, value, 10) catch {
+        try fail("invalid --limit: {s}", .{value});
+        unreachable;
+    };
+    if (parsed == 0) {
+        try fail("--limit must be greater than zero", .{});
+        unreachable;
+    }
+    return parsed;
+}
+
 fn printEventSummary(writer: *std.Io.Writer, event: Event) !void {
     try writer.print("#{d} {s} [{s}] {s}\n", .{ event.id, event.timestamp, event.source, event.text });
     if (event.entities.len > 0) {
@@ -958,16 +1193,7 @@ fn writeDot(allocator: Allocator, writer: *std.Io.Writer, events: []const Event)
         while (i < event.entities.len) : (i += 1) {
             var j = i + 1;
             while (j < event.entities.len) : (j += 1) {
-                const a = try entityKeyAlloc(allocator, event.entities[i]);
-                defer allocator.free(a);
-                const b = try entityKeyAlloc(allocator, event.entities[j]);
-                defer allocator.free(b);
-
-                const edge_key = if (std.mem.lessThan(u8, a, b))
-                    try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ a, b })
-                else
-                    try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ b, a });
-
+                const edge_key = try edgeKeyAlloc(allocator, event.entities[i], event.entities[j]);
                 if (edges.getPtr(edge_key)) |count| {
                     count.* += 1;
                     allocator.free(edge_key);
