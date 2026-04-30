@@ -80,7 +80,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, command, "export")) {
         try cmdExport(gpa, cli.db_path, rest);
     } else {
-        try fail("unknown command: {s}", .{command});
+        fail("unknown command: {s}", .{command});
     }
 }
 
@@ -117,7 +117,8 @@ fn printUsage() !void {
         \\  intel [--db PATH] path <from> <to>
         \\  intel [--db PATH] rank entities [--kind KIND] [--limit N]
         \\  intel [--db PATH] rank edges [--limit N]
-        \\  intel [--db PATH] export graph [--format dot] [--out file.dot]
+        \\  intel [--db PATH] export graph [--format dot|json] [--out FILE]
+        \\  intel [--db PATH] export events [--format jsonl] [--out FILE]
         \\  intel [--db PATH] stats
         \\
         \\Examples:
@@ -611,11 +612,10 @@ fn cmdRankEdges(gpa: Allocator, db_path: []const u8, args: []const []const u8) !
 }
 
 fn cmdExport(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
-    if (args.len < 1 or !std.mem.eql(u8, args[0], "graph")) {
-        return fail("export currently supports: export graph [--format dot] [--out file.dot]", .{});
-    }
+    if (args.len < 1) return fail("export requires graph or events", .{});
 
-    var format: []const u8 = "dot";
+    const target = args[0];
+    var format: []const u8 = if (std.mem.eql(u8, target, "events")) "jsonl" else "dot";
     var out_path: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) {
@@ -631,7 +631,6 @@ fn cmdExport(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
             return fail("unknown export option: {s}", .{args[i]});
         }
     }
-    if (!std.mem.eql(u8, format, "dot")) return fail("unsupported export format: {s}", .{format});
 
     var set = try loadEvents(gpa, db_path);
     defer set.deinit();
@@ -641,12 +640,12 @@ fn cmdExport(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
         defer file.close();
         var buf: [8192]u8 = undefined;
         var writer = file.writer(&buf);
-        try writeDot(gpa, &writer.interface, set.events);
+        try writeExport(gpa, &writer.interface, target, format, set.events);
         try writer.interface.flush();
     } else {
         var buf: [8192]u8 = undefined;
         var writer = std.fs.File.stdout().writer(&buf);
-        try writeDot(gpa, &writer.interface, set.events);
+        try writeExport(gpa, &writer.interface, target, format, set.events);
         try writer.interface.flush();
     }
 }
@@ -1135,12 +1134,10 @@ fn collectCountItems(allocator: Allocator, counts: *std.StringHashMap(u64)) ![]C
 
 fn parseLimit(value: []const u8) !usize {
     const parsed = std.fmt.parseInt(usize, value, 10) catch {
-        try fail("invalid --limit: {s}", .{value});
-        unreachable;
+        fail("invalid --limit: {s}", .{value});
     };
     if (parsed == 0) {
-        try fail("--limit must be greater than zero", .{});
-        unreachable;
+        fail("--limit must be greater than zero", .{});
     }
     return parsed;
 }
@@ -1213,6 +1210,123 @@ fn shortestPath(
         path[reversed.items.len - 1 - idx] = node;
     }
     return path;
+}
+
+fn writeExport(
+    allocator: Allocator,
+    writer: *std.Io.Writer,
+    target: []const u8,
+    format: []const u8,
+    events: []const Event,
+) !void {
+    if (std.mem.eql(u8, target, "graph")) {
+        if (std.mem.eql(u8, format, "dot")) {
+            try writeDot(allocator, writer, events);
+        } else if (std.mem.eql(u8, format, "json")) {
+            try writeGraphJson(allocator, writer, events);
+        } else {
+            return fail("unsupported graph export format: {s}", .{format});
+        }
+    } else if (std.mem.eql(u8, target, "events")) {
+        if (!std.mem.eql(u8, format, "jsonl")) return fail("unsupported events export format: {s}", .{format});
+        try writeEventsJsonl(writer, events);
+    } else {
+        return fail("unknown export target: {s}", .{target});
+    }
+}
+
+fn writeEventsJsonl(writer: *std.Io.Writer, events: []const Event) !void {
+    for (events) |event| {
+        try writer.print("{{\"id\":{d},\"timestamp\":", .{event.id});
+        try writeJsonString(writer, event.timestamp);
+        try writer.writeAll(",\"source\":");
+        try writeJsonString(writer, event.source);
+        try writer.writeAll(",\"text\":");
+        try writeJsonString(writer, event.text);
+        try writer.writeAll(",\"entities\":[");
+        for (event.entities, 0..) |entity, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            try writer.writeAll("{\"kind\":");
+            try writeJsonString(writer, entity.kind);
+            try writer.writeAll(",\"value\":");
+            try writeJsonString(writer, entity.value);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]}\n");
+    }
+}
+
+fn writeGraphJson(allocator: Allocator, writer: *std.Io.Writer, events: []const Event) !void {
+    var node_ids = std.StringHashMap(u64).init(allocator);
+    defer {
+        var keys = node_ids.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        node_ids.deinit();
+    }
+
+    var node_labels: std.ArrayList([]const u8) = .empty;
+    defer node_labels.deinit(allocator);
+
+    var edges = std.StringHashMap(u64).init(allocator);
+    defer {
+        var keys = edges.keyIterator();
+        while (keys.next()) |key| allocator.free(key.*);
+        edges.deinit();
+    }
+
+    for (events) |event| {
+        for (event.entities) |entity| {
+            const key = try entityKeyAlloc(allocator, entity);
+            if (node_ids.contains(key)) {
+                allocator.free(key);
+            } else {
+                const id: u64 = @intCast(node_labels.items.len);
+                try node_ids.put(key, id);
+                try node_labels.append(allocator, key);
+            }
+        }
+
+        var i: usize = 0;
+        while (i < event.entities.len) : (i += 1) {
+            var j = i + 1;
+            while (j < event.entities.len) : (j += 1) {
+                const edge_key = try edgeKeyAlloc(allocator, event.entities[i], event.entities[j]);
+                if (edges.getPtr(edge_key)) |count| {
+                    count.* += 1;
+                    allocator.free(edge_key);
+                } else {
+                    try edges.put(edge_key, 1);
+                }
+            }
+        }
+    }
+
+    const edge_items = try collectCountItems(allocator, &edges);
+    defer allocator.free(edge_items);
+    std.mem.sort(CountItem, edge_items, {}, countItemGreater);
+
+    try writer.writeAll("{\"nodes\":[");
+    for (node_labels.items, 0..) |label, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.print("{{\"id\":{d},\"label\":", .{idx});
+        try writeJsonString(writer, label);
+        try writer.writeByte('}');
+    }
+
+    try writer.writeAll("],\"edges\":[");
+    var written_edges: usize = 0;
+    for (edge_items) |edge| {
+        const tab = std.mem.indexOfScalar(u8, edge.key, '\t') orelse continue;
+        const left = edge.key[0..tab];
+        const right = edge.key[tab + 1 ..];
+        const left_id = node_ids.get(left) orelse continue;
+        const right_id = node_ids.get(right) orelse continue;
+
+        if (written_edges > 0) try writer.writeByte(',');
+        try writer.print("{{\"source\":{d},\"target\":{d},\"weight\":{d}}}", .{ left_id, right_id, edge.count });
+        written_edges += 1;
+    }
+    try writer.writeAll("]}\n");
 }
 
 fn writeDot(allocator: Allocator, writer: *std.Io.Writer, events: []const Event) !void {
@@ -1289,15 +1403,36 @@ fn writeDotString(writer: *std.Io.Writer, value: []const u8) !void {
     }
 }
 
-fn fail(comptime fmt: []const u8, args: anytype) !void {
+fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try writer.writeByte('"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11...12, 14...0x1f => {
+                try writer.writeAll("\\u00");
+                try writer.writeByte(hex[byte >> 4]);
+                try writer.writeByte(hex[byte & 0x0f]);
+            },
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [1024]u8 = undefined;
     var writer = std.fs.File.stderr().writer(&buf);
     const err = &writer.interface;
-    try err.writeAll("error: ");
-    try err.print(fmt, args);
-    try err.writeByte('\n');
-    try err.flush();
-    return error.CommandFailed;
+    err.writeAll("error: ") catch {};
+    err.print(fmt, args) catch {};
+    err.writeByte('\n') catch {};
+    err.flush() catch {};
+    std.process.exit(1);
 }
 
 test "extracts common entities" {

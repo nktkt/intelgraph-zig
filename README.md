@@ -1,6 +1,6 @@
 # IntelGraph Zig
 
-IntelGraph Zig is a local-first intelligence graph CLI written in Zig. It ingests line-oriented logs, extracts common entities, stores events locally, and helps analysts search events, inspect relationships, build timelines, find paths, and export Graphviz maps.
+IntelGraph Zig is a local-first intelligence graph CLI written in Zig. It ingests line-oriented logs, extracts common entities, stores events locally, and helps analysts search events, inspect relationships, build timelines, find paths, and export graph or event data.
 
 The tool is designed for defensive analysis, incident response, audit review, and local data exploration. It does not exploit systems, intercept traffic, or send data anywhere. The first version intentionally has no network calls and no external runtime dependencies.
 
@@ -16,7 +16,7 @@ The default local store is `.intelgraph/events.tsv` in the current directory.
 - Build filtered timelines
 - Find shortest paths between related entities
 - Rank frequently observed entities and relationships
-- Export an undirected Graphviz DOT graph
+- Export events as JSONL and graphs as Graphviz DOT or JSON
 
 ## Build
 
@@ -39,6 +39,8 @@ zig build run -- rank edges --limit 10
 zig build run -- path alice@example.com suspicious.example
 zig build run -- timeline --entity suspicious.example --limit 10
 zig build run -- export graph --out graph.dot
+zig build run -- export graph --format json --out graph.json
+zig build run -- export events --out events.jsonl
 ```
 
 Render the DOT output with Graphviz:
@@ -58,7 +60,8 @@ intel [--db PATH] timeline [--entity <value|kind:value>] [--limit N]
 intel [--db PATH] path <from> <to>
 intel [--db PATH] rank entities [--kind KIND] [--limit N]
 intel [--db PATH] rank edges [--limit N]
-intel [--db PATH] export graph [--format dot] [--out file.dot]
+intel [--db PATH] export graph [--format dot|json] [--out FILE]
+intel [--db PATH] export events [--format jsonl] [--out FILE]
 intel [--db PATH] stats
 ```
 
