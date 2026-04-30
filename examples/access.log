@@ -1,0 +1,5 @@
+2026-04-30T10:00:01Z user=alice src=10.0.0.12 dst=198.51.100.7 host=portal.example.com action=login status=ok
+2026-04-30T10:04:44Z user=alice src=10.0.0.12 url=https://cdn.safe.example/update.js hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+2026-04-30T10:07:12Z user=bob src=10.0.0.44 dst=203.0.113.9 url=https://suspicious.example/dropper sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+2026-04-30T10:10:03Z account=alice@example.com src=10.0.0.12 dst=203.0.113.9 host=suspicious.example action=dns_query
+2026-04-30T10:12:51Z user=carol src=10.0.0.88 dst=192.0.2.5 host=vpn.example.net action=connect
