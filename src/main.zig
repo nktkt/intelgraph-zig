@@ -110,10 +110,10 @@ fn printUsage() !void {
         \\
         \\Usage:
         \\  intel [--db PATH] init
-        \\  intel [--db PATH] ingest <file> [--source NAME]
-        \\  intel [--db PATH] search <text>
-        \\  intel [--db PATH] entity <value|kind:value>
-        \\  intel [--db PATH] timeline [--entity <value|kind:value>]
+        \\  intel [--db PATH] ingest <file|-> [--source NAME]
+        \\  intel [--db PATH] search <text> [--limit N]
+        \\  intel [--db PATH] entity <value|kind:value> [--limit N]
+        \\  intel [--db PATH] timeline [--entity <value|kind:value>] [--limit N]
         \\  intel [--db PATH] path <from> <to>
         \\  intel [--db PATH] rank entities [--kind KIND] [--limit N]
         \\  intel [--db PATH] rank edges [--limit N]
@@ -143,7 +143,7 @@ fn cmdInit(db_path: []const u8) !void {
 fn cmdIngest(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
     if (args.len < 1) return fail("ingest requires a file path", .{});
     const input_path = args[0];
-    var source = input_path;
+    var source: []const u8 = if (std.mem.eql(u8, input_path, "-")) "stdin" else input_path;
 
     var i: usize = 1;
     while (i < args.len) {
@@ -158,8 +158,15 @@ fn cmdIngest(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
 
     try ensureStore(db_path);
 
-    var input_file = try std.fs.cwd().openFile(input_path, .{});
-    defer input_file.close();
+    var input_file: std.fs.File = undefined;
+    var close_input = false;
+    if (std.mem.eql(u8, input_path, "-")) {
+        input_file = std.fs.File.stdin();
+    } else {
+        input_file = try std.fs.cwd().openFile(input_path, .{});
+        close_input = true;
+    }
+    defer if (close_input) input_file.close();
 
     var file = try std.fs.cwd().createFile(db_path, .{ .read = true, .truncate = false });
     defer file.close();
@@ -272,6 +279,18 @@ fn cmdStats(gpa: Allocator, db_path: []const u8) !void {
 fn cmdSearch(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
     if (args.len < 1) return fail("search requires text", .{});
     const query = args[0];
+    var limit: usize = std.math.maxInt(usize);
+
+    var i: usize = 1;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--limit")) {
+            if (i + 1 >= args.len) return fail("--limit requires a value", .{});
+            limit = try parseLimit(args[i + 1]);
+            i += 2;
+        } else {
+            return fail("unknown search option: {s}", .{args[i]});
+        }
+    }
 
     var set = try loadEvents(gpa, db_path);
     defer set.deinit();
@@ -281,18 +300,34 @@ fn cmdSearch(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
     const out = &writer.interface;
 
     var shown: usize = 0;
+    var matches: usize = 0;
     for (set.events) |event| {
         if (!eventContains(event, query)) continue;
-        try printEventSummary(out, event);
-        shown += 1;
+        matches += 1;
+        if (shown < limit) {
+            try printEventSummary(out, event);
+            shown += 1;
+        }
     }
-    try out.print("matches: {d}\n", .{shown});
+    try out.print("matches: {d}\nshown: {d}\n", .{ matches, shown });
     try out.flush();
 }
 
 fn cmdEntity(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
     if (args.len < 1) return fail("entity requires a value or kind:value", .{});
     const query = args[0];
+    var limit: usize = std.math.maxInt(usize);
+
+    var i: usize = 1;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--limit")) {
+            if (i + 1 >= args.len) return fail("--limit requires a value", .{});
+            limit = try parseLimit(args[i + 1]);
+            i += 2;
+        } else {
+            return fail("unknown entity option: {s}", .{args[i]});
+        }
+    }
 
     var set = try loadEvents(gpa, db_path);
     defer set.deinit();
@@ -309,6 +344,7 @@ fn cmdEntity(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
     const out = &writer.interface;
 
     var hits: usize = 0;
+    var shown: usize = 0;
     for (set.events) |event| {
         if (!eventHasEntity(event, query)) continue;
         hits += 1;
@@ -322,24 +358,37 @@ fn cmdEntity(gpa: Allocator, db_path: []const u8, args: []const []const u8) !voi
                 try neighbors.put(key, 1);
             }
         }
-        try printEventSummary(out, event);
+        if (shown < limit) {
+            try printEventSummary(out, event);
+            shown += 1;
+        }
     }
 
-    try out.print("\nevents: {d}\nneighbors:\n", .{hits});
-    var iter = neighbors.iterator();
-    while (iter.next()) |entry| {
-        try out.print("  {s} ({d})\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+    var neighbor_items = try collectCountItems(gpa, &neighbors);
+    defer gpa.free(neighbor_items);
+    std.mem.sort(CountItem, neighbor_items, {}, countItemGreater);
+
+    try out.print("\nevents: {d}\nshown: {d}\nneighbors:\n", .{ hits, shown });
+    const neighbors_shown = @min(limit, neighbor_items.len);
+    for (neighbor_items[0..neighbors_shown]) |item| {
+        try out.print("  {s} ({d})\n", .{ item.key, item.count });
     }
     try out.flush();
 }
 
 fn cmdTimeline(gpa: Allocator, db_path: []const u8, args: []const []const u8) !void {
     var entity_filter: ?[]const u8 = null;
+    var limit: usize = std.math.maxInt(usize);
+
     var i: usize = 0;
     while (i < args.len) {
         if (std.mem.eql(u8, args[i], "--entity")) {
             if (i + 1 >= args.len) return fail("--entity requires a value", .{});
             entity_filter = args[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--limit")) {
+            if (i + 1 >= args.len) return fail("--limit requires a value", .{});
+            limit = try parseLimit(args[i + 1]);
             i += 2;
         } else {
             return fail("unknown timeline option: {s}", .{args[i]});
@@ -356,14 +405,18 @@ fn cmdTimeline(gpa: Allocator, db_path: []const u8, args: []const []const u8) !v
     const out = &writer.interface;
 
     var shown: usize = 0;
+    var matches: usize = 0;
     for (set.events) |event| {
         if (entity_filter) |filter| {
             if (!eventHasEntity(event, filter)) continue;
         }
-        try printEventSummary(out, event);
-        shown += 1;
+        matches += 1;
+        if (shown < limit) {
+            try printEventSummary(out, event);
+            shown += 1;
+        }
     }
-    try out.print("events: {d}\n", .{shown});
+    try out.print("events: {d}\nshown: {d}\n", .{ matches, shown });
     try out.flush();
 }
 
@@ -483,24 +536,19 @@ fn cmdRankEntities(gpa: Allocator, db_path: []const u8, args: []const []const u8
         }
     }
 
-    var items: std.ArrayList(CountItem) = .empty;
-    defer items.deinit(gpa);
-
-    var iter = counts.iterator();
-    while (iter.next()) |entry| {
-        try items.append(gpa, .{ .key = entry.key_ptr.*, .count = entry.value_ptr.* });
-    }
-    std.mem.sort(CountItem, items.items, {}, countItemGreater);
+    var items = try collectCountItems(gpa, &counts);
+    defer gpa.free(items);
+    std.mem.sort(CountItem, items, {}, countItemGreater);
 
     var buf: [8192]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buf);
     const out = &writer.interface;
 
-    const shown = @min(limit, items.items.len);
-    for (items.items[0..shown], 0..) |item, idx| {
+    const shown = @min(limit, items.len);
+    for (items[0..shown], 0..) |item, idx| {
         try out.print("{d}. {s} ({d})\n", .{ idx + 1, item.key, item.count });
     }
-    try out.print("ranked: {d}\n", .{items.items.len});
+    try out.print("ranked: {d}\n", .{items.len});
     try out.flush();
 }
 
@@ -544,26 +592,21 @@ fn cmdRankEdges(gpa: Allocator, db_path: []const u8, args: []const []const u8) !
         }
     }
 
-    var items: std.ArrayList(CountItem) = .empty;
-    defer items.deinit(gpa);
-
-    var iter = counts.iterator();
-    while (iter.next()) |entry| {
-        try items.append(gpa, .{ .key = entry.key_ptr.*, .count = entry.value_ptr.* });
-    }
-    std.mem.sort(CountItem, items.items, {}, countItemGreater);
+    var items = try collectCountItems(gpa, &counts);
+    defer gpa.free(items);
+    std.mem.sort(CountItem, items, {}, countItemGreater);
 
     var buf: [8192]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buf);
     const out = &writer.interface;
 
-    const shown = @min(limit, items.items.len);
-    for (items.items[0..shown], 0..) |item, idx| {
+    const shown = @min(limit, items.len);
+    for (items[0..shown], 0..) |item, idx| {
         try out.print("{d}. ", .{idx + 1});
         try writeEdgeLabel(out, item.key);
         try out.print(" ({d})\n", .{item.count});
     }
-    try out.print("ranked: {d}\n", .{items.items.len});
+    try out.print("ranked: {d}\n", .{items.len});
     try out.flush();
 }
 
@@ -1078,6 +1121,16 @@ fn writeEdgeLabel(writer: *std.Io.Writer, edge_key: []const u8) !void {
 fn countItemGreater(_: void, lhs: CountItem, rhs: CountItem) bool {
     if (lhs.count == rhs.count) return std.mem.lessThan(u8, lhs.key, rhs.key);
     return lhs.count > rhs.count;
+}
+
+fn collectCountItems(allocator: Allocator, counts: *std.StringHashMap(u64)) ![]CountItem {
+    var items: std.ArrayList(CountItem) = .empty;
+    errdefer items.deinit(allocator);
+    var iter = counts.iterator();
+    while (iter.next()) |entry| {
+        try items.append(allocator, .{ .key = entry.key_ptr.*, .count = entry.value_ptr.* });
+    }
+    return items.toOwnedSlice(allocator);
 }
 
 fn parseLimit(value: []const u8) !usize {

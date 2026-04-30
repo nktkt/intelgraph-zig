@@ -8,7 +8,7 @@ The default local store is `.intelgraph/events.tsv` in the current directory.
 
 ## Features
 
-- Ingest line-oriented logs from local files
+- Ingest line-oriented logs from local files or standard input
 - Extract IP addresses, domains, URLs, email addresses, hashes, and user identifiers
 - Store events in a simple local TSV database
 - Search raw events and extracted entities
@@ -32,11 +32,12 @@ The binary is installed at `zig-out/bin/intel`.
 zig build run -- init
 zig build run -- ingest examples/access.log
 zig build run -- stats
-zig build run -- entity ip:10.0.0.12
+zig build run -- search suspicious --limit 5
+zig build run -- entity ip:10.0.0.12 --limit 5
 zig build run -- rank entities --kind domain --limit 10
 zig build run -- rank edges --limit 10
 zig build run -- path alice@example.com suspicious.example
-zig build run -- timeline --entity suspicious.example
+zig build run -- timeline --entity suspicious.example --limit 10
 zig build run -- export graph --out graph.dot
 ```
 
@@ -50,15 +51,21 @@ dot -Tpng graph.dot -o graph.png
 
 ```text
 intel [--db PATH] init
-intel [--db PATH] ingest <file> [--source NAME]
-intel [--db PATH] search <text>
-intel [--db PATH] entity <value|kind:value>
-intel [--db PATH] timeline [--entity <value|kind:value>]
+intel [--db PATH] ingest <file|-> [--source NAME]
+intel [--db PATH] search <text> [--limit N]
+intel [--db PATH] entity <value|kind:value> [--limit N]
+intel [--db PATH] timeline [--entity <value|kind:value>] [--limit N]
 intel [--db PATH] path <from> <to>
 intel [--db PATH] rank entities [--kind KIND] [--limit N]
 intel [--db PATH] rank edges [--limit N]
 intel [--db PATH] export graph [--format dot] [--out file.dot]
 intel [--db PATH] stats
+```
+
+Use `-` as the ingest path to read from standard input:
+
+```sh
+tail -f app.log | intel ingest - --source app.log
 ```
 
 ## Extracted Entities
